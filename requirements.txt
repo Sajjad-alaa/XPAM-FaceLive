@@ -1,0 +1,5 @@
+# Pinned for a repeatable image. OpenCV 4.x on purpose: the YuNet model file has a fixed input shape,
+# which OpenCV 5's ONNX engine does not accept.
+opencv-python-headless==4.11.0.86
+numpy==2.0.2
+websockets==15.0.1
