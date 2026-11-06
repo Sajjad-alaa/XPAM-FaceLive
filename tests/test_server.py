@@ -196,6 +196,18 @@ class ServerTest(unittest.IsolatedAsyncioTestCase):
                     break
             self.assertTrue(last["fatal"])
 
+    async def test_binary_messages_count_as_bad_frames(self):
+        await self.start(FakeCore())
+        async with connect(self.url()) as ws:
+            await self.recv(ws)
+            last = None
+            for _ in range(10):
+                await ws.send(b"\x00\x01")
+                last = await self.recv(ws)
+                if last.get("fatal"):
+                    break
+            self.assertTrue(last["fatal"])
+
     async def test_a_second_connection_with_the_same_token_replaces_the_first(self):
         await self.start(FakeCore())
         async with connect(self.url()) as first:
@@ -277,8 +289,19 @@ class FrameDecodingTest(unittest.TestCase):
         with self.assertRaises(FrameError):
             decode_frame(json.dumps({"type": "frame", "image": "data:image/jpeg;base64," + base64.b64encode(data).decode()}), 1000)
         frame, raw = decode_frame(json.dumps({"type": "frame", "image": data_url(photo("person_a_1", 1200))}), 4 * 1024 * 1024)
-        self.assertEqual(frame.shape[1], 640)          # wider pictures are made smaller
+        self.assertEqual(max(frame.shape[:2]), 640)    # larger pictures are made smaller (by the longer side)
         self.assertTrue(raw.startswith(b"\xff\xd8"))
+
+    def test_tall_or_long_frames_are_refused_and_the_longer_side_is_limited(self):
+        import numpy as np
+        for shape in ((4000, 256, 3), (256, 4000, 3), (1000, 200, 3)):
+            message = json.dumps({"type": "frame", "image": data_url(np.zeros(shape, np.uint8))})
+            with self.assertRaises(FrameError):
+                decode_frame(message, 4 * 1024 * 1024)
+        frame, _ = decode_frame(json.dumps({"type": "frame", "image": data_url(np.full((1200, 800, 3), 90, np.uint8))}),
+                                4 * 1024 * 1024)
+        self.assertEqual(max(frame.shape[:2]), 640)
+        self.assertEqual(frame.shape[1], 427)
 
     def test_a_jpeg_header_with_a_huge_size_is_refused_before_decoding(self):
         data = bytearray(jpeg(photo("person_a_1", 480)))

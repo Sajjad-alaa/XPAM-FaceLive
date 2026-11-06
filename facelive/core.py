@@ -9,6 +9,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import http.client
 import json
 import logging
 import os
@@ -84,6 +85,7 @@ class CoreClient:
         self._key = None
         self.ready = False
         self._lock = None
+        self._reconnect_task = None
         self._context = None
         if settings.core_host.startswith("https") and not settings.core_tls_verify:
             self._context = ssl.create_default_context()
@@ -114,6 +116,8 @@ class CoreClient:
             return error.code, parsed
         except (urllib.error.URLError, TimeoutError, OSError) as error:
             raise CoreError("core is not reachable: %s" % type(error).__name__) from None
+        except (ValueError, http.client.HTTPException) as error:
+            raise CoreError("core sent an unreadable answer: %s" % type(error).__name__) from None
 
     def _signed(self, method, path, body=None):
         key_id, secret = self._key
@@ -182,6 +186,25 @@ class CoreClient:
                 await asyncio.sleep(delay)
                 delay = min(delay * 1.7, 60.0)
 
+    def _start_reconnect(self):
+        """When ready went False, make sure one background task keeps trying (5 s -> 60 s) until it is True."""
+        if self._reconnect_task is None or self._reconnect_task.done():
+            self._reconnect_task = asyncio.get_running_loop().create_task(self._reconnect())
+
+    async def _reconnect(self):
+        delay = 5.0
+        while not self.ready:
+            await asyncio.sleep(delay)
+            if self.ready:
+                break
+            try:
+                await self.connect()
+            except CoreError as error:
+                log.warning("waiting for core: %s", error)
+            except Exception as error:  # a bug must not stop the retries
+                log.error("core connection failed: %s", type(error).__name__)
+            delay = min(delay * 2, 60.0)
+
     # ---- calls
 
     async def _call(self, method, path, body=None):
@@ -191,6 +214,7 @@ class CoreClient:
         if status in (401, 403) and self.settings.bootstrap_token:
             # the key may have been removed in core: register again once
             self.ready = False
+            self._start_reconnect()
             await self.connect()
             status, reply = await asyncio.to_thread(self._signed, method, path, body)
         return status, reply

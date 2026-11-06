@@ -55,6 +55,10 @@ class CompareUnavailable(Exception):
     """Core could not answer a comparison."""
 
 
+class CompareRejected(Exception):
+    """Core refused the comparison for good (the check expired, finished or reached its limit)."""
+
+
 def _now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -93,6 +97,7 @@ class FlowSession:
         self._base = None             # (yaw_u, pitch_v)
         self._reference = None        # feature of the face that started the capture
         self._challenge = None
+        self._challenge_kind = None   # kept after a loss, so hiding the face does not draw a new challenge
         self._challenge_passed = False
         self._tries = 0
         self._swaps = 0
@@ -235,7 +240,7 @@ class FlowSession:
             return self._result(frame, [], now)
 
         # 1. the same picture again, or a camera that sends no new picture
-        reason = self.replay.check(raw, frame)
+        reason = await self._run(self.replay.check, raw, frame)
         if reason:
             self._replay_strikes += 1
             self.guidance = "replayed_frame"
@@ -331,10 +336,18 @@ class FlowSession:
             self._after_challenge()
 
     def _start_challenge(self, now):
+        if self._tries >= MAX_CHALLENGE_TRIES:
+            self._finish(False, "liveness")
+            return
         kinds = [SHAKE, NOD]
         if self._challenge is not None and len(kinds) > 1:
             kinds = [k for k in kinds if k != self._challenge.kind] or kinds
-        kind = self.rng.choice(kinds)
+            kind = self.rng.choice(kinds)
+        elif self._challenge_kind:
+            kind = self._challenge_kind
+        else:
+            kind = self.rng.choice(kinds)
+        self._challenge_kind = kind
         self._tries += 1
         self._challenge = Challenge(kind, now, self.settings.challenge_timeout, self._base[0], self._base[1],
                                     self.yaw_turn, self.pitch_nod)

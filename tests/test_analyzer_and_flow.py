@@ -213,6 +213,20 @@ class ChallengeTest(unittest.TestCase):
         with_pose(driver, analyzer, [None] * 10)            # more than 3 seconds
         self.assertEqual(driver.flow.phase, "calibrating")
 
+    def test_hiding_the_face_restarts_the_same_challenge_and_tries_are_limited(self):
+        analyzer, driver = self.make(seed=2)
+        self.calibrate(analyzer, driver)
+        kind = self.kind_of(driver)
+        with_pose(driver, analyzer, [None] * 14)            # lost for long: calibrate again
+        self.assertEqual(driver.flow.phase, "calibrating")
+        with_pose(driver, analyzer, [STRAIGHT] * 3)
+        self.assertEqual(driver.flow.phase, "challenge")
+        self.assertEqual(self.kind_of(driver), kind)         # the same kind, not a new draw
+        with_pose(driver, analyzer, [None] * 14)
+        with_pose(driver, analyzer, [STRAIGHT] * 3)          # a third start is over the limit
+        self.assertTrue(driver.flow.finished)
+        self.assertEqual(driver.flow.detail, "Liveness check failed")
+
     def test_a_face_that_jumps_resets_the_challenge(self):
         analyzer, driver = self.make(seed=2)
         self.calibrate(analyzer, driver)

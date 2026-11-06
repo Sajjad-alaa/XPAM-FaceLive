@@ -26,7 +26,7 @@ from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 
 from .core import CoreClient, CoreError
-from .flow import AUTH, ENROLL, CompareUnavailable, FlowSession
+from .flow import AUTH, ENROLL, CompareRejected, CompareUnavailable, FlowSession
 
 log = logging.getLogger("facelive.server")
 
@@ -34,10 +34,14 @@ TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,128}$")  # the same rule as the p
 WS_PATHS = ("/ws/facelive/capture/", "/ws/facelive/capture", "/facelive/capture/", "/facelive/capture")
 HEALTH_PATHS = ("/facelive/health", "/facelive/health/", "/ws/facelive/health", "/ws/facelive/health/")
 JPEG_PREFIX = "data:image/jpeg;base64,"
-MAX_SIDE = 640            # frames wider than this are made smaller before analysis
+MAX_SIDE = 640            # frames whose longer side is more than this are made smaller before analysis
+MAX_INPUT_SIDE = 1920     # refuse pictures with a longer side than this, before decoding them
+MAX_ASPECT = 3.0          # refuse pictures longer than 3:1 (either way)
 MAX_PIXELS = 4096 * 4096  # refuse pictures that would be huge in memory
 IDLE_SECONDS = 25         # no frame for this long: close
 MAX_BAD_FRAMES = 8        # bad frames in a row before the connection is closed
+LIFETIME_MARGIN = 30      # a connection lives at most the flow deadline plus this many seconds
+EXPIRED_MESSAGE = "This face check has expired. Please try again."
 CLOSE_INVALID_TOKEN = 4403
 
 
@@ -91,13 +95,17 @@ def decode_frame(message, max_bytes):
     size = jpeg_size(raw)
     if not size or size[0] < 32 or size[1] < 32 or size[0] * size[1] > MAX_PIXELS:
         raise FrameError("The frame size is not accepted")
+    if max(size) > MAX_INPUT_SIDE or max(size) > MAX_ASPECT * min(size):
+        raise FrameError("The frame size is not accepted")
     frame = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
     if frame is None:
         raise FrameError("The frame could not be decoded")
     height, width = frame.shape[:2]
-    if width > MAX_SIDE:
-        scale = MAX_SIDE / float(width)
-        frame = cv2.resize(frame, (MAX_SIDE, max(1, int(round(height * scale)))), interpolation=cv2.INTER_AREA)
+    longer = max(width, height)
+    if longer > MAX_SIDE:
+        scale = MAX_SIDE / float(longer)
+        frame = cv2.resize(frame, (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+                           interpolation=cv2.INTER_AREA)
     return frame, raw
 
 
@@ -237,6 +245,8 @@ class FaceServer:
                 return await self.core.compare(token, code)
             except CoreError as error:
                 log.warning("comparison failed: %s", error)
+                if error.status in (400, 404):
+                    raise CompareRejected() from None
                 raise CompareUnavailable() from None
 
         flow = FlowSession(self.settings, mode, self.analyzer, compare,
@@ -258,13 +268,25 @@ class FaceServer:
     async def frame_loop(self, websocket, token, flow):
         last_frame = -1e9
         bad_frames = 0
+        ends_at = time.monotonic() + flow._deadline() + LIFETIME_MARGIN
         while True:
+            remaining = ends_at - time.monotonic()
+            if remaining <= 0:
+                await self.fatal(websocket, "Face capture timed out")
+                return
             try:
-                message = await asyncio.wait_for(websocket.recv(), timeout=IDLE_SECONDS)
+                message = await asyncio.wait_for(websocket.recv(), timeout=min(IDLE_SECONDS, remaining))
             except asyncio.TimeoutError:
-                await self.fatal(websocket, "No camera frames were received")
+                if time.monotonic() >= ends_at:
+                    await self.fatal(websocket, "Face capture timed out")
+                else:
+                    await self.fatal(websocket, "No camera frames were received")
                 return
             if isinstance(message, bytes):
+                bad_frames += 1
+                if bad_frames >= MAX_BAD_FRAMES:
+                    await self.fatal(websocket, "Binary frames are not accepted")
+                    return
                 await self.send(websocket, {"type": "error", "fatal": False, "message": "Binary frames are not accepted"})
                 continue
             now = time.monotonic()
@@ -285,6 +307,9 @@ class FaceServer:
             bad_frames = 0
             try:
                 result = await flow.process_frame(frame, raw)
+            except CompareRejected:
+                await self.fatal(websocket, EXPIRED_MESSAGE)
+                return
             except CompareUnavailable:
                 await self.fatal(websocket, "The face service cannot reach the server", 1013)
                 return
@@ -310,6 +335,9 @@ class FaceServer:
                 return True
             except CoreError as error:
                 log.warning("sending the result to core failed (%s)", error)
+                if error.status in (400, 404):  # the token is finished or expired: retrying cannot help
+                    await self.fatal(websocket, EXPIRED_MESSAGE)
+                    return False
                 await asyncio.sleep(0.5 * (attempt + 1))
         await self.fatal(websocket, "The face service cannot reach the server", 1013)
         return False
