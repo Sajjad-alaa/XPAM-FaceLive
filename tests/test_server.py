@@ -279,6 +279,38 @@ class ServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 503)
         status, _ = await loop.run_in_executor(None, get, "/other")
         self.assertEqual(status, 404)
+        status, _ = await loop.run_in_executor(None, get, "/ws/facelive/health")
+        self.assertEqual(status, 404)
+        # Cross-origin WebSocket handshake must be rejected with 403
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/ws/facelive/capture/?token=%s" % (self.port, TOKEN),
+            headers={"Origin": "https://evil.example"},
+        )
+        with self.assertRaises(HTTPError) as caught:
+            await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=5))
+        self.assertEqual(caught.exception.code, 403)
+
+        def handshake_status(origin, host):
+            req = urllib.request.Request(
+                "http://127.0.0.1:%d/ws/facelive/capture/?token=%s" % (self.port, TOKEN),
+                headers={"Origin": origin, "Host": host},
+            )
+            try:
+                return urllib.request.urlopen(req, timeout=5).status
+            except HTTPError as error:
+                return error.code
+
+        # behind the gateway: the Origin keeps a non-default port, the forwarded Host (nginx $host) does not
+        status = await loop.run_in_executor(None, handshake_status, "https://xpam.example:8443", "xpam.example")
+        self.assertNotEqual(status, 403)
+        status = await loop.run_in_executor(None, handshake_status, "https://XPAM.example", "xpam.example:443")
+        self.assertNotEqual(status, 403)
+        status = await loop.run_in_executor(None, handshake_status, "https://[::1]:8443", "[::1]")
+        self.assertNotEqual(status, 403)
+        for origin, host in (("https://xpam.example.evil", "xpam.example"), ("null", "xpam.example"),
+                             ("https://[::1", "xpam.example")):
+            status = await loop.run_in_executor(None, handshake_status, origin, host)
+            self.assertEqual(status, 403, (origin, host))
 
 
 class FrameDecodingTest(unittest.TestCase):
@@ -310,6 +342,10 @@ class FrameDecodingTest(unittest.TestCase):
         message = json.dumps({"type": "frame", "image": "data:image/jpeg;base64," + base64.b64encode(bytes(data)).decode()})
         with self.assertRaises(FrameError):
             decode_frame(message, 4 * 1024 * 1024)
+        # A fake small SOF0 inserted before a huge SOF0 must also be refused
+        fake_sof = b"\xff\xc0\x00\x0b\x08\x00\x40\x00\x40\x01\x01\x11\x00"
+        smuggled = bytes(data[:2]) + fake_sof + bytes(data[2:])
+        self.assertIsNone(jpeg_size(smuggled))
 
 
 if __name__ == "__main__":

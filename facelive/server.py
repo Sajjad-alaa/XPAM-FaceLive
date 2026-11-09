@@ -32,7 +32,7 @@ log = logging.getLogger("facelive.server")
 
 TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,128}$")  # the same rule as the page (isFaceCaptureToken)
 WS_PATHS = ("/ws/facelive/capture/", "/ws/facelive/capture", "/facelive/capture/", "/facelive/capture")
-HEALTH_PATHS = ("/facelive/health", "/facelive/health/", "/ws/facelive/health", "/ws/facelive/health/")
+HEALTH_PATHS = ("/facelive/health", "/facelive/health/")
 JPEG_PREFIX = "data:image/jpeg;base64,"
 MAX_SIDE = 640            # frames whose longer side is more than this are made smaller before analysis
 MAX_INPUT_SIDE = 1920     # refuse pictures with a longer side than this, before decoding them
@@ -54,23 +54,34 @@ def jpeg_size(data):
     if len(data) < 4 or data[0:2] != b"\xff\xd8":
         return None
     index = 2
-    while index + 9 < len(data):
+    found = None
+    while index + 4 <= len(data):
         if data[index] != 0xFF:
+            return None
+        while index < len(data) and data[index] == 0xFF:
             index += 1
-            continue
-        marker = data[index + 1]
+        if index >= len(data):
+            return None
+        marker = data[index]
+        index += 1
         if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
-            index += 2
             continue
-        if marker == 0xFF:
-            index += 1
-            continue
-        (length,) = struct.unpack(">H", data[index + 2:index + 4])
+        if marker in (0xD9, 0xDA):  # EOI or SOS (entropy-coded data starts here)
+            break
+        if index + 2 > len(data):
+            return None
+        (length,) = struct.unpack(">H", data[index:index + 2])
+        if length < 2 or index + length > len(data):
+            return None
         if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
-            height, width = struct.unpack(">HH", data[index + 5:index + 9])
-            return width, height
-        index += 2 + length
-    return None
+            if length < 7 or index + 7 > len(data):
+                return None
+            height, width = struct.unpack(">HH", data[index + 3:index + 7])
+            if found is not None and found != (width, height):
+                return None  # refuse multi-frame JPEGs with conflicting SOF dimensions
+            found = (width, height)
+        index += length
+    return found
 
 
 def decode_frame(message, max_bytes):
@@ -169,6 +180,18 @@ class FaceServer:
             return response
         if path not in WS_PATHS:
             return connection.respond(HTTPStatus.NOT_FOUND, "Not found\n")
+        # a page of another site may not open a capture: the browser's Origin must name the host it called. Host
+        # names only — the gateway forwards Host without the port (nginx $host), the Origin keeps it.
+        origin = (request.headers.get("Origin") or "").strip()
+        host = (request.headers.get("Host") or "").strip()
+        if origin and host:
+            try:
+                origin_name = (urlsplit(origin).hostname or "").lower()
+                host_name = (urlsplit("//" + host).hostname or "").lower()
+            except ValueError:  # a malformed address (e.g. an unclosed IPv6 bracket)
+                origin_name = host_name = ""
+            if not origin_name or origin_name != host_name:
+                return connection.respond(HTTPStatus.FORBIDDEN, "Forbidden\n")
         return None
 
     # ---- WebSocket side

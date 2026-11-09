@@ -6,8 +6,14 @@ is only a thin launcher that calls run() here.
 """
 import asyncio
 import logging
+import os
 import signal
 import sys
+
+# Cap OpenCV's native image decoder before cv2 is imported so crafted headers cannot allocate huge buffers
+os.environ.setdefault("OPENCV_IO_MAX_IMAGE_WIDTH", "1920")
+os.environ.setdefault("OPENCV_IO_MAX_IMAGE_HEIGHT", "1920")
+os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", str(1920 * 1920))
 
 from .analyzer import FaceAnalyzer
 from .config import load_settings
