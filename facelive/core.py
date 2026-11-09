@@ -29,6 +29,37 @@ PROFILE_PATH = "/api/v1/users/profile/"
 CONTEXT_PATH = "/api/v1/authentication/face/engine/context/"
 COMPARE_PATH = "/api/v1/authentication/face/engine/compare/"
 CALLBACK_PATH = "/api/v1/authentication/face/callback/"
+STATUS_PATH = "/api/v1/terminal/status/"
+
+
+def _read_load(data_path="/"):
+    """Best-effort CPU/memory/disk use for the status heartbeat, with no extra dependency. Returns
+    percentages (0..100). Any read that fails contributes 0.0 instead of breaking the heartbeat."""
+    cpu = mem = disk = 0.0
+    try:  # 1-minute load average as a share of the CPUs, as a percentage
+        with open("/proc/loadavg") as f:
+            one = float(f.read().split()[0])
+        cpu = min(100.0, one / (os.cpu_count() or 1) * 100.0)
+    except Exception:
+        pass
+    try:  # used memory from MemTotal/MemAvailable
+        info = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                info[k] = float(v.split()[0])
+        total, avail = info.get("MemTotal", 0.0), info.get("MemAvailable", 0.0)
+        if total:
+            mem = max(0.0, min(100.0, (total - avail) / total * 100.0))
+    except Exception:
+        pass
+    try:
+        st = os.statvfs(data_path)
+        if st.f_blocks:
+            disk = (st.f_blocks - st.f_bfree) / st.f_blocks * 100.0
+    except Exception:
+        pass
+    return cpu, mem, disk
 
 
 class CoreError(Exception):
@@ -185,6 +216,37 @@ class CoreClient:
             if not self.ready:
                 await asyncio.sleep(delay)
                 delay = min(delay * 1.7, 60.0)
+
+    async def send_status(self, session_online=0):
+        """Report load to core once (POST /api/v1/terminal/status/). Core marks this component alive for
+        three minutes per report, so it shows online in the console's Components page like the others."""
+        cpu, mem, disk = _read_load()
+        body = {
+            "sessions": [],
+            "session_online": int(session_online),
+            "cpu_load": round(cpu, 1),
+            "memory_used": round(mem, 1),
+            "disk_used": round(disk, 1),
+        }
+        status, _ = await self._call("POST", STATUS_PATH, body)
+        if status not in (200, 201):
+            raise CoreError("core answered %s to a status heartbeat" % status, status)
+
+    async def heartbeat(self, sessions_provider=None, interval=60):
+        """Run in the background: once connected, report status straight away and then every `interval`
+        seconds (well within core's three-minute alive window) so this component shows online. A failed
+        heartbeat is logged and retried on the next round."""
+        while not self.ready:          # wait for the first connection before the first report
+            await asyncio.sleep(2)
+        while True:
+            try:
+                online = int(sessions_provider()) if sessions_provider else 0
+                await self.send_status(online)
+            except CoreError as error:
+                log.warning("status heartbeat not sent: %s", error)
+            except Exception as error:  # a bug must not stop later heartbeats
+                log.error("status heartbeat error: %s", type(error).__name__)
+            await asyncio.sleep(interval)
 
     def _start_reconnect(self):
         """When ready went False, make sure one background task keeps trying (5 s -> 60 s) until it is True."""

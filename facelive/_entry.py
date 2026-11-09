@@ -36,9 +36,11 @@ async def main():
     for name in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(name, stop.set)
     background = asyncio.create_task(server.core.keep_connected())
+    heartbeat = asyncio.create_task(server.core.heartbeat(lambda: server.limits.active))
     running = asyncio.create_task(server.run())
     await stop.wait()
     running.cancel()
+    heartbeat.cancel()
     background.cancel()
 
 
