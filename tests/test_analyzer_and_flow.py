@@ -191,6 +191,33 @@ class ChallengeTest(unittest.TestCase):
         self.assertEqual(driver.flow.phase, "calibrating")
         self.assertFalse(driver.flow.outcome and driver.flow.outcome.success)
 
+    def test_a_face_swapped_during_the_movement_is_rejected(self):
+        for seed in range(1, 40):
+            analyzer, driver = self.make(seed=seed)
+            self.calibrate(analyzer, driver)
+            if self.kind_of(driver) == SHAKE:
+                break
+        else:
+            self.fail("no seed gave a shake challenge")
+        other = np.zeros(128)
+        other[5] = 1.0
+        analyzer.features = [other] * 20          # another person performs the movement
+        with_pose(driver, analyzer, [(-0.05, 0.55)])
+        self.assertNotIn("challenge_failed", driver.events)        # (one comparison alone is not a swap)
+        with_pose(driver, analyzer, [(-0.06, 0.55)])
+        self.assertIn("challenge_failed", driver.events)
+        self.assertEqual(driver.result["flow"]["guidance"], "liveness")
+        self.assertEqual(driver.flow.phase, "calibrating")
+        self.assertFalse(driver.flow.outcome and driver.flow.outcome.success)
+
+    def test_the_same_face_turning_its_head_passes(self):
+        analyzer, driver = self.make(seed=2)
+        self.calibrate(analyzer, driver)
+        moves, back = self.run_challenge(driver, analyzer, self.kind_of(driver))
+        with_pose(driver, analyzer, [STRAIGHT, (-0.04, 0.55), (0.04, 0.55)] + moves + back)
+        self.assertNotIn("challenge_failed", driver.events)
+        self.assertIn("challenge_passed", driver.events)
+
     def test_a_timed_out_challenge_is_retried_once_then_fails(self):
         analyzer, driver = self.make(seed=2, challenge_timeout=5.0)
         self.calibrate(analyzer, driver)
@@ -257,8 +284,9 @@ class ChallengeTest(unittest.TestCase):
         moves, back = self.run_challenge(driver, analyzer, self.kind_of(driver))
         rng = np.random.default_rng(5)
         samples = [np.ones(128) + rng.normal(size=128) * 0.05 for _ in range(3)]
+        with_pose(driver, analyzer, moves)
         analyzer.features = [np.ones(128)] + list(samples)     # (the first one is used to compare after the challenge)
-        with_pose(driver, analyzer, moves + back)
+        with_pose(driver, analyzer, back)
         self.assertEqual(driver.flow.phase, "sampling")
         self.assertEqual(driver.result["flow"]["status"], "enrolling")
         with_pose(driver, analyzer, [STRAIGHT] * 2)

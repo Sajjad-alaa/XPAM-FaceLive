@@ -31,6 +31,9 @@ AUTH_MAX_MISMATCHES = 6         # non-matching frames that end the attempt
 MAX_CHALLENGE_TRIES = 2
 MAX_SWAPS = 2                   # a different face after the challenge: end the attempt
 MAX_BAD_RUN = 4                 # frames in a row whose face is not the face that started the capture
+MOVE_CHECK_FRACTION = 0.5       # during the challenge, frames turned at most this part of the way are compared
+MOVE_CHECK_GAP_SECONDS = 0.25   # between two comparisons during the challenge
+MAX_MOVE_MISMATCHES = 2         # comparisons in a row during the challenge that are another face: a swap
 MAX_REPLAY_STRIKES = 25
 SECOND_FACE_RATIO = 0.10        # another face this wide (of the frame) counts as a second person
 COMPARE_ERRORS_FATAL = 3
@@ -102,6 +105,8 @@ class FlowSession:
         self._tries = 0
         self._swaps = 0
         self._bad_run = 0
+        self._move_checked_at = -1e9
+        self._move_mismatches = 0
         self._last_matched = False
         self._replay_strikes = 0
         self._last_center = None
@@ -349,6 +354,8 @@ class FlowSession:
             kind = self.rng.choice(kinds)
         self._challenge_kind = kind
         self._tries += 1
+        self._move_checked_at = -1e9
+        self._move_mismatches = 0
         self._challenge = Challenge(kind, now, self.settings.challenge_timeout, self._base[0], self._base[1],
                                     self.yaw_turn, self.pitch_nod)
         self.phase = "challenge"
@@ -365,22 +372,49 @@ class FlowSession:
                 self._start_challenge(now)
             return
         if not just_passed:
+            await self._check_moving_face(frame, face, now)
             return
         # the face that comes back must be the face that started the capture
         feature = await self._run(self.analyzer.embed, frame, face)
         if codes.cosine(feature, self._reference) < CONTINUITY_COSINE:
-            self._swaps += 1
-            self.guidance = "liveness"
-            self._event("challenge_failed", challenge=challenge.kind, reason="face_changed")
-            if self._swaps >= MAX_SWAPS or self._tries >= MAX_CHALLENGE_TRIES:
-                self._finish(False, "liveness")
-            else:
-                self._challenge = None
-                self._restart_calibration()
+            self._face_swapped(challenge)
             return
         self._challenge_passed = True
         self._event("challenge_passed", challenge=challenge.kind)
         self._after_challenge()
+
+    async def _check_moving_face(self, frame, face, now):
+        """The face that moves must be the face that started the capture: another person performing the movement
+        (and a photo of the account's owner before and after it) is a swap. Only frames turned at most part of the
+        way are compared — further turned faces compare less reliably — a few times a second."""
+        challenge = self._challenge
+        if challenge is None or self._reference is None:
+            return
+        du = abs(face.pose.yaw_u - challenge.base_u)
+        dv = abs(face.pose.pitch_v - challenge.base_v)
+        if du > challenge.yaw_turn * MOVE_CHECK_FRACTION or dv > challenge.pitch_nod * MOVE_CHECK_FRACTION:
+            return
+        if now - self._move_checked_at < MOVE_CHECK_GAP_SECONDS:
+            return
+        self._move_checked_at = now
+        feature = await self._run(self.analyzer.embed, frame, face)
+        if codes.cosine(feature, self._reference) >= CONTINUITY_COSINE:
+            self._move_mismatches = 0
+            return
+        self._move_mismatches += 1
+        if self._move_mismatches >= MAX_MOVE_MISMATCHES:
+            self._face_swapped(challenge)
+
+    def _face_swapped(self, challenge):
+        self._move_mismatches = 0
+        self._swaps += 1
+        self.guidance = "liveness"
+        self._event("challenge_failed", challenge=challenge.kind, reason="face_changed")
+        if self._swaps >= MAX_SWAPS or self._tries >= MAX_CHALLENGE_TRIES:
+            self._finish(False, "liveness")
+        else:
+            self._challenge = None
+            self._restart_calibration()
 
     def _after_challenge(self):
         self.phase = "sampling" if self.mode == ENROLL else "verifying"
