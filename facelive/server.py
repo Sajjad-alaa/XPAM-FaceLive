@@ -12,6 +12,7 @@ import base64
 import binascii
 import json
 import logging
+import os
 import re
 import struct
 import time
@@ -199,9 +200,13 @@ class FaceServer:
     @staticmethod
     def client_ip(websocket):
         forwarded = websocket.request.headers.get("X-Forwarded-For", "")
-        if forwarded:
-            # (the last address is the one the gateway saw; earlier ones are whatever the client claimed)
-            return forwarded.split(",")[-1].strip()
+        parts = [part.strip() for part in forwarded.split(",") if part.strip()]
+        if parts:
+            # The last address is the one the gateway saw; earlier ones are whatever the client claimed. With a
+            # trusted load balancer in front of the gateway (USE_LB=0) the gateway saw the load balancer: the
+            # browser is the address the load balancer recorded, the one before it.
+            hops = 2 if os.environ.get("USE_LB", "1").strip() == "0" else 1
+            return parts[-hops] if len(parts) >= hops else parts[0]
         remote = websocket.remote_address
         return remote[0] if remote else "unknown"
 

@@ -350,3 +350,36 @@ class FrameDecodingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClientAddressTest(unittest.TestCase):
+    """The address the per-address limits count: never one the client chose."""
+
+    class _Socket:
+        def __init__(self, forwarded):
+            self.request = type("R", (), {"headers": {"X-Forwarded-For": forwarded} if forwarded else {}})()
+            self.remote_address = ("172.17.0.9", 50000)
+
+    def address(self, forwarded, use_lb=None):
+        import os
+        old = os.environ.pop("USE_LB", None)
+        try:
+            if use_lb is not None:
+                os.environ["USE_LB"] = use_lb
+            return FaceServer.client_ip(self._Socket(forwarded))
+        finally:
+            os.environ.pop("USE_LB", None)
+            if old is not None:
+                os.environ["USE_LB"] = old
+
+    def test_the_gateway_is_the_first_hop(self):
+        self.assertEqual(self.address("203.0.113.7"), "203.0.113.7")
+        self.assertEqual(self.address("6.6.6.6, 203.0.113.7"), "203.0.113.7")  # (the claimed one is ignored)
+
+    def test_behind_a_trusted_load_balancer_the_browser_is_the_one_it_recorded(self):
+        self.assertEqual(self.address("6.6.6.6, 203.0.113.7, 10.0.0.2", use_lb="0"), "203.0.113.7")
+        self.assertEqual(self.address("203.0.113.7, 10.0.0.2", use_lb="0"), "203.0.113.7")
+        self.assertEqual(self.address("10.0.0.2", use_lb="0"), "10.0.0.2")
+
+    def test_without_the_header_the_socket_address_counts(self):
+        self.assertEqual(self.address(""), "172.17.0.9")
